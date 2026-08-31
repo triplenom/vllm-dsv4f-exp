@@ -11,6 +11,24 @@ import regex as re
 from vllm.model_executor.models.utils import WeightsMapper
 
 
+def is_dsv4_vision_weight(name: str) -> bool:
+    """True for vision-tower/aligner weights at any prefix depth.
+
+    Checkpoint/HF names arrive as ``vision.…`` / ``aligner.…`` and become
+    ``model.vision.…`` / ``model.aligner.…`` after prefix mapping; inside
+    ``DeepseekV4Model.load_weights`` the ``model.`` prefix is stripped again,
+    so the relative names START with ``vision.``/``aligner.``. Match both
+    forms. Their ``w1``/``w2`` tensors must never be treated as
+    shared-expert ``gate_up_proj`` shards by the stacked-params mapping.
+    """
+    return (
+        name.startswith("vision.")
+        or name.startswith("aligner.")
+        or ".vision." in name
+        or ".aligner." in name
+    )
+
+
 def make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
         # MXFP4 experts use Mxfp4MoEMethod, which registers scales as

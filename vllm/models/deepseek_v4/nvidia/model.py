@@ -94,7 +94,10 @@ from vllm.models.deepseek_v4.processing import (
     DeepseekV4VisionMultiModalProcessor,
     DeepseekV4VisionProcessingInfo,
 )
-from vllm.models.deepseek_v4.weights import make_deepseek_v4_weights_mapper
+from vllm.models.deepseek_v4.weights import (
+    is_dsv4_vision_weight,
+    make_deepseek_v4_weights_mapper,
+)
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -1843,7 +1846,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # treated as shared-expert gate_up_proj shards.
                 if ".experts." in name:
                     continue
-                if ".vision." in name or ".aligner." in name:
+                if is_dsv4_vision_weight(name):
                     continue
                 if weight_name not in name:
                     continue

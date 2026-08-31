@@ -100,3 +100,32 @@ def test_fp8_mapper_variant():
     assert (
         mapper._map_name("aligner.w1.weight") == "model.aligner.w1.weight"
     )
+
+
+is_dsv4_vision_weight = import_dsv4_submodule("weights").is_dsv4_vision_weight
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        # Relative names as seen by DeepseekV4Model.load_weights (the
+        # "model." prefix is stripped by AutoWeightsLoader). Regression:
+        # "aligner.w1.bias" reached the stacked gate_up_proj mapping because
+        # the old guard only matched the dotted infix form.
+        ("aligner.w1.weight", True),
+        ("aligner.w1.bias", True),
+        ("aligner.w2.weight", True),
+        ("vision.blocks.3.mlp.w1.weight", True),
+        ("vision.patch_embed.proj.weight", True),
+        # Fully prefixed forms also match.
+        ("model.vision.blocks.0.mlp.w2.weight", True),
+        ("model.aligner.w1.bias", True),
+        # Ordinary LM weights must NOT match.
+        ("layers.0.ffn.shared_experts.w1.weight", False),
+        ("layers.61.ffn.experts.5.w1.weight", False),
+        ("embed_tokens.weight", False),
+        ("layers.0.attn.wq_a.weight", False),
+    ],
+)
+def test_is_dsv4_vision_weight(name, expected):
+    assert is_dsv4_vision_weight(name) is expected
