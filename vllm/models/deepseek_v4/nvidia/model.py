@@ -56,6 +56,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
+    MultiModalEmbeddings,
     SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
@@ -88,7 +89,6 @@ from vllm.models.deepseek_v4.image_processing import (
 from vllm.models.deepseek_v4.vision import DeepseekV4Aligner, DeepseekV4ViT
 from vllm.models.deepseek_v4.vision_routing import dsv4_vision_aware_topk
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalEmbeddings
 from vllm.models.deepseek_v4.processing import (
     DeepseekV4VisionDummyInputsBuilder,
     DeepseekV4VisionMultiModalProcessor,
