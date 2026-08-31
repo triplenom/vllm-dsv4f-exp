@@ -1458,7 +1458,11 @@ class SpecDecodeBaseProposer:
                 )
                 self.supports_mm_inputs = False
 
-        if supports_multimodal(target_model):
+        # Class-level supports_multimodal() is not enough here: some models
+        # (e.g. DeepseekV4ForCausalLM) implement the interface but only act
+        # multimodal for specific configs. Gate on the registry-level check
+        # so text-only configs keep the plain draft path.
+        if supports_multimodal(target_model) and self.supports_mm_inputs:
             # handle multimodality
             assert hasattr(target_model, "config")
             if self.get_model_name(target_model) in [
@@ -1489,10 +1493,13 @@ class SpecDecodeBaseProposer:
                 self.model.config.image_token_index = (
                     target_model.config.media_placeholder_token_id
                 )
-            else:
+            elif hasattr(target_model.config, "image_token_index"):
                 self.model.config.image_token_index = (
                     target_model.config.image_token_index
                 )
+            # else: models like DeepseekV4ForCausalLM use synthetic image
+            # token ids (vocab_size + type) rather than a single placeholder
+            # index; the draft masks them by the vocab bound instead.
             target_language_model = cast(
                 SupportsMultiModal, target_model
             ).get_language_model()

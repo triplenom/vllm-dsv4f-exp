@@ -56,3 +56,20 @@ def test_embed_input_ids_moves_is_multimodal_to_input_device():
     pad_section = src[src.index("pad_mask") - 600 :]
     pad_section = pad_section[: pad_section.index("pad_mask") + 400]
     assert 'is_multimodal.to(device=input_ids.device' in pad_section
+
+
+def test_proposer_mm_branch_guards_deepseek_v4():
+    """Regression: with speculative decoding enabled, the base proposer's
+    multimodal branch must not fire for text-only configs of a
+    SupportsMultiModal model (DeepseekV4ForCausalLM is always
+    SupportsMultiModal but only multimodal for vision configs), and must not
+    assume the target config has image_token_index (DeepSeek V4 uses
+    synthetic ids instead)."""
+    src = (
+        REPO_ROOT / "vllm" / "v1" / "spec_decode" / "llm_base_proposer.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        "if supports_multimodal(target_model) and self.supports_mm_inputs:"
+        in src
+    )
+    assert 'hasattr(target_model.config, "image_token_index")' in src
