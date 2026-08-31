@@ -1526,7 +1526,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # No .any() host sync here: this path runs per step on vision models.
         # The boolean-mask assignment is a no-op when no pads are present.
         if is_multimodal is not None:
-            pad_mask = (input_ids == self.vocab_size + IMAGE_PAD) & ~is_multimodal
+            # The runner keeps is_multimodal on CPU (index-put into
+            # inputs_embeds works cross-device and avoids a D2H sync), but
+            # combining it with the CUDA input_ids comparison requires the
+            # same device.
+            mm_mask = is_multimodal.to(device=input_ids.device, non_blocking=True)
+            pad_mask = (input_ids == self.vocab_size + IMAGE_PAD) & ~mm_mask
         else:
             pad_mask = input_ids == self.vocab_size + IMAGE_PAD
         inputs_embeds[pad_mask] = self.image_pad.to(inputs_embeds.dtype)

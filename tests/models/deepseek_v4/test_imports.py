@@ -45,3 +45,14 @@ def test_no_hardcoded_local_paths_or_credentials_in_new_modules():
         src = (pkg / name).read_text(encoding="utf-8")
         assert "import C:" not in src and "/tmp/" not in src
         assert "ghp_" not in src  # no credentials
+
+
+def test_embed_input_ids_moves_is_multimodal_to_input_device():
+    """Regression: the runner passes is_multimodal on CPU; combining it with
+    CUDA input_ids in embed_input_ids crashed with a cross-device error on
+    the very first request. The pad-mask computation must move the mask to
+    the input_ids device first."""
+    src = NVIDIA_MODEL.read_text(encoding="utf-8")
+    pad_section = src[src.index("pad_mask") - 600 :]
+    pad_section = pad_section[: pad_section.index("pad_mask") + 400]
+    assert 'is_multimodal.to(device=input_ids.device' in pad_section
