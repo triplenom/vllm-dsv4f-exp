@@ -488,11 +488,29 @@ class InputProcessor:
 
             # Here we take the max of the two to determine if a token id is
             # truly out-of-vocabulary.
+            # Mirrors NUM_IMAGE_TOKEN_TYPES in
+            # vllm/models/deepseek_v4/image_processing.py (kept as a local
+            # constant to avoid importing model code into the engine).
+            _DSV4_NUM_IMAGE_TOKEN_TYPES = 5
             model_vocab_size = model_config.get_vocab_size()
             if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
-                raise VLLMValidationError(
-                    f"Token id {max_input_id} is out of vocabulary"
+                # DeepSeek V4 Vision-Exp carries synthetic image token ids
+                # (vocab_size + type, type < NUM_IMAGE_TOKEN_TYPES) in the
+                # prompt; they are replaced by multimodal embeddings before
+                # the LM embedding lookup and drive image routing/visibility.
+                hf_config = model_config.hf_config
+                is_dsv4_vision = (
+                    getattr(hf_config, "model_type", None) == "deepseek_v4"
+                    and getattr(hf_config, "vision_n_layers", 0) > 0
                 )
+                if not (
+                    is_dsv4_vision
+                    and max_input_id
+                    < model_vocab_size + _DSV4_NUM_IMAGE_TOKEN_TYPES
+                ):
+                    raise VLLMValidationError(
+                        f"Token id {max_input_id} is out of vocabulary"
+                    )
 
     def _validate_model_inputs(
         self,

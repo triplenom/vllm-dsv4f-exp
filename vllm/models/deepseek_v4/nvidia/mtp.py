@@ -61,6 +61,7 @@ from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
     _use_sequence_parallel,
+    get_image_visible_torch,
     make_deepseek_v4_expert_params_mapping,
 )
 
@@ -198,6 +199,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        self.config = config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
 
@@ -234,6 +236,14 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if getattr(self.config, "vision_n_layers", 0) > 0:
+            # Vision-Exp: synthetic image ids (vocab_size + type) never index
+            # the embedding table. The draft does not consume image embeddings
+            # directly (image content arrives via the target model's hidden
+            # states), so mask the sentinels out of the vocabulary lookup.
+            input_ids = input_ids.masked_fill(
+                input_ids >= self.config.vocab_size, 0
+            )
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -244,8 +254,16 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        if getattr(self.config, "vision_n_layers", 0) > 0 and (
+            input_ids is not None and is_forward_context_available()
+        ):
+            # Vision-Exp: the draft's sparse-MLA layers read image-span
+            # visibility from the forward context, same as the target model.
+            get_forward_context().dsv4_image_visible = get_image_visible_torch(
+                input_ids, self.config.vocab_size, self.config.vision_max_n_token
+            )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_input_ids(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
         return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
             input_ids,
@@ -475,7 +493,14 @@ class DeepSeekV4MTP(nn.Module):
                     loaded_params.add(name)
                     continue
                 else:
-                    if name.endswith(".ffn.gate.bias"):
+                    if name.endswith(".ffn.gate.bias_vl"):
+                        # Vision-Exp routing bias lives on the gate as
+                        # ``e_score_correction_bias_vl``.
+                        name = name.replace(
+                            ".ffn.gate.bias_vl",
+                            ".ffn.gate.e_score_correction_bias_vl",
+                        )
+                    elif name.endswith(".ffn.gate.bias"):
                         # ``e_score_correction_bias`` lives on the gate
                         # under a different attribute name.
                         name = name.replace(

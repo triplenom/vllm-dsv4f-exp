@@ -4,7 +4,6 @@ import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
-import regex as re
 import torch
 import torch.nn as nn
 
@@ -58,12 +57,13 @@ from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
     SupportsEagle3,
+    SupportsMultiModal,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
+    _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
     make_layers,
@@ -78,6 +78,23 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
+from vllm.models.deepseek_v4.image_processing import (
+    IMAGE,
+    IMAGE_PAD,
+    IMAGE_PLACEHOLDER,
+    NUM_IMAGE_TOKEN_TYPES,
+    get_image_visible_torch,
+)
+from vllm.models.deepseek_v4.vision import DeepseekV4Aligner, DeepseekV4ViT
+from vllm.models.deepseek_v4.vision_routing import dsv4_vision_aware_topk
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalEmbeddings
+from vllm.models.deepseek_v4.processing import (
+    DeepseekV4VisionDummyInputsBuilder,
+    DeepseekV4VisionMultiModalProcessor,
+    DeepseekV4VisionProcessingInfo,
+)
+from vllm.models.deepseek_v4.weights import make_deepseek_v4_weights_mapper
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -631,6 +648,7 @@ class DeepseekV4MoE(nn.Module):
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
 
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.num_experts_per_tok
@@ -659,6 +677,13 @@ class DeepseekV4MoE(nn.Module):
 
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
+        # Vision-Exp: the checkpoint carries a vision routing bias
+        # (``ffn.gate.bias_vl``) on every MoE layer. Image positions
+        # (synthetic ids >= vocab_size) are always routed score-based with
+        # this bias; at hash-routing layers they bypass the text ``tid2eid``
+        # table entirely (reference ``Gate.forward`` in inference/model.py).
+        self.has_vision_routing = getattr(config, "vision_n_layers", 0) > 0
+        self.gate.e_score_correction_bias_vl = None
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         if is_hash_moe:
@@ -674,8 +699,20 @@ class DeepseekV4MoE(nn.Module):
                 ),
                 requires_grad=False,
             )
+            if self.has_vision_routing:
+                # Vision-Exp checkpoints carry the (unused) text routing bias
+                # on hash layers too; register it so loading succeeds.
+                self.gate.e_score_correction_bias = nn.Parameter(
+                    torch.empty(config.n_routed_experts, dtype=torch.float32),
+                    requires_grad=False,
+                )
         elif getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+        if self.has_vision_routing:
+            self.gate.e_score_correction_bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
@@ -794,6 +831,82 @@ class DeepseekV4MoE(nn.Module):
             is_sequence_parallel=self.use_sequence_parallel,
         )
         self._sync_fused_moe_metadata()
+        if self.has_vision_routing:
+            self._install_vision_aware_routing()
+
+    def _install_vision_aware_routing(self) -> None:
+        """Swap the fused router's ``_compute_routing`` for the Vision-Exp
+        semantics (reference ``Gate.forward``).
+
+        This runs for every step of a Vision-Exp model: for pure-text tokens
+        the result is identical to the stock router (hash layers still use
+        ``tid2eid``; score layers still use ``scores + bias``), while image
+        positions (synthetic ids >= vocab_size) use the score-based vision
+        path with ``bias_vl`` and never touch ``tid2eid``. The bias shifts
+        expert *selection* only; routing weights always come from the
+        un-biased scores. EPLB mapping / dtype conversion still happen in
+        ``BaseRouter._select_experts`` around this call.
+        """
+        router = self.experts.router
+        bias_vl = self.gate.e_score_correction_bias_vl
+        vocab_size = self.vocab_size
+
+        def _compute_routing_vision_aware(
+            hidden_states: torch.Tensor,
+            router_logits: torch.Tensor,
+            indices_type: torch.dtype | None,
+            *,
+            input_ids: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if input_ids is None:
+                raise ValueError(
+                    "DeepSeek V4 Vision-Exp routing requires input_ids."
+                )
+            topk_weights, topk_ids = dsv4_vision_aware_topk(
+                router_logits,
+                scoring_func=router.scoring_func,
+                e_score_correction_bias=(
+                    router.e_score_correction_bias.data
+                    if router.e_score_correction_bias is not None
+                    else None
+                ),
+                vision_correction_bias=bias_vl.data,
+                tid2eid=(
+                    router._hash_indices_table.data
+                    if router._hash_indices_table is not None
+                    else None
+                ),
+                input_ids=input_ids,
+                vocab_size=vocab_size,
+                topk=router.top_k,
+                renormalize=router.renormalize,
+                routed_scaling_factor=router.routed_scaling_factor,
+                # The intermediate dtype here is irrelevant: indices are
+                # converted to the requested dtype downstream.
+                indices_dtype=torch.int64,
+            )
+
+            # Mirror FusedTopKBiasRouter._compute_routing: fused shared
+            # experts are appended as constant slots after the routed top-k.
+            if router.num_fused_shared_experts > 0:
+                m = topk_ids.shape[0]
+                n = router.num_fused_shared_experts
+                base = router.global_num_experts
+                shared_ids = torch.arange(
+                    base, base + n, dtype=topk_ids.dtype, device=topk_ids.device
+                ).expand(m, n)
+                shared_w = torch.full(
+                    (m, n),
+                    router.shared_expert_weight,
+                    dtype=topk_weights.dtype,
+                    device=topk_weights.device,
+                )
+                topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
+                topk_weights = torch.cat([topk_weights, shared_w], dim=-1)
+
+            return topk_weights, topk_ids
+
+        router._compute_routing = _compute_routing_vision_aware
 
     def _sync_fused_moe_metadata(self) -> None:
         experts = self.experts
@@ -842,20 +955,43 @@ class DeepseekV4MoE(nn.Module):
 
         org_shape = hidden_states.shape
         router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else None,
-            topk=self.n_activated_experts,
-            renormalize=self.renormalize,
-            indices_type=self.hash_indices_dtype,
-            input_tokens=input_ids,
-            hash_indices_table=self.gate.tid2eid,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
+        if self.gate.e_score_correction_bias_vl is not None:
+            # Vision-Exp routing (reference Gate.forward): image positions
+            # (synthetic ids >= vocab_size) are score-routed with bias_vl and
+            # never touch the text tid2eid hash table. Text positions are
+            # routed exactly as before.
+            topk_weights, topk_ids = dsv4_vision_aware_topk(
+                router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                vision_correction_bias=self.gate.e_score_correction_bias_vl.data,
+                tid2eid=self.gate.tid2eid.data
+                if self.gate.tid2eid is not None
+                else None,
+                input_ids=input_ids,
+                vocab_size=self.vocab_size,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                routed_scaling_factor=self.routed_scaling_factor,
+                indices_dtype=self.hash_indices_dtype,
+            )
+        else:
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
@@ -1266,6 +1402,50 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # Vision-Exp (DeepSeek-V4-Flash-Vision-Exp): ViT + aligner + the four
+        # special image embeddings (start/end/newline/pad), active iff the
+        # config carries the vision_* fields. Text-only 0731 configs skip all
+        # of this and keep the exact existing behavior. The vision tower is
+        # replicated per TP rank and lives on the first PP rank (where input
+        # embeddings are produced), mirroring ``embed_tokens``.
+        self.vision_enabled = getattr(config, "vision_n_layers", 0) > 0
+        self.max_image_tokens = (
+            getattr(config, "vision_max_n_token", 0) if self.vision_enabled else 0
+        )
+        if self.vision_enabled and self.use_sequence_parallel:
+            raise NotImplementedError(
+                "DeepSeek V4 Vision-Exp does not support sequence parallelism "
+                "yet (image-visibility metadata is aligned with the full "
+                "token stream before SP sharding)."
+            )
+        if self.vision_enabled and (
+            not vllm_config.scheduler_config.disable_chunked_mm_input
+        ):
+            # The reference implementation requires each image region to be
+            # prefilled atomically (inference/model.py asserts it); the vLLM
+            # scheduler guarantees that with --disable-chunked-mm-input
+            # (multimodal items roll back to the chunk before the item).
+            raise ValueError(
+                "DeepSeek V4 Vision-Exp requires --disable-chunked-mm-input "
+                "so that each image span is prefilled atomically."
+            )
+        if self.vision_enabled and get_pp_group().is_first_rank:
+            self.vision = DeepseekV4ViT(config)
+            self.aligner = DeepseekV4Aligner(
+                config.vision_dim, config.hidden_size, config.vision_downsample_ratio
+            )
+            self.image_start = nn.Parameter(torch.empty(config.hidden_size))
+            self.image_end = nn.Parameter(torch.empty(config.hidden_size))
+            self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+            self.image_pad = nn.Parameter(torch.empty(config.hidden_size))
+        elif self.vision_enabled:
+            self.vision = PPMissingLayer()
+            self.aligner = PPMissingLayer()
+            self.image_start = PPMissingLayer()
+            self.image_end = PPMissingLayer()
+            self.image_newline = PPMissingLayer()
+            self.image_pad = PPMissingLayer()
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -1321,8 +1501,110 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self._mtp_hidden_buffer = None
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: list[torch.Tensor] | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.vision_enabled:
+            return self.embed_tokens(input_ids)
+
+        # Vision-Exp: image block positions carry synthetic ids
+        # ``vocab_size + type`` which must never index the embedding table.
+        # Text positions embed normally; IMAGE_PAD positions not covered by
+        # the mm merge (the compressor-alignment pads preceding IMAGE_START)
+        # take the ``image_pad`` embedding, exactly like the reference
+        # ``merge_image_embeddings`` (params[types] with IMAGE -> ViT output).
+        image_mask = input_ids >= self.vocab_size
+        safe_ids = input_ids.masked_fill(image_mask, 0)
+        inputs_embeds = self.embed_tokens(safe_ids)
+        # No .any() host sync here: this path runs per step on vision models.
+        # The boolean-mask assignment is a no-op when no pads are present.
+        if is_multimodal is not None:
+            pad_mask = (input_ids == self.vocab_size + IMAGE_PAD) & ~is_multimodal
+        else:
+            pad_mask = input_ids == self.vocab_size + IMAGE_PAD
+        inputs_embeds[pad_mask] = self.image_pad.to(inputs_embeds.dtype)
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+        return _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
+
+    def _encode_image(
+        self,
+        patches: torch.Tensor,
+        n_vit_h: int,
+        n_vit_w: int,
+    ) -> torch.Tensor:
+        """ViT + aligner for one image (reference ``encode_image``)."""
+        return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
+
+    def embed_multimodal(self, **kwargs: object) -> list[torch.Tensor]:
+        """Build the LM-hidden image block embeddings for one mm batch.
+
+        Consumes the per-image fields produced by
+        ``DeepseekV4VisionMultiModalProcessor`` and returns one
+        ``(num_block_tokens, hidden_size)`` tensor per image (in item order),
+        matching the ``[IMAGE_START, IMAGE_END]`` placeholder ranges. Mirrors
+        the reference ``merge_image_embeddings``: block entries come from the
+        special image embeddings by semantic type, with IMAGE slots replaced
+        by the aligner outputs gathered with ``perm``.
+        """
+        from vllm.models.deepseek_v4.processing import (
+            K_GRID,
+            K_PATCHES,
+            K_PERM,
+            K_TYPES,
+        )
+
+        if not self.vision_enabled or isinstance(self.vision, PPMissingLayer):
+            raise ValueError(
+                "embed_multimodal called on a DeepSeek V4 model without the "
+                "Vision-Exp tower on this rank."
+            )
+
+        def _per_item(data: object) -> list[torch.Tensor]:
+            if isinstance(data, torch.Tensor):
+                return list(data.unbind(0))
+            return list(data)  # type: ignore[arg-type]
+
+        patches_lst = _per_item(kwargs[K_PATCHES])
+        grid = kwargs[K_GRID]
+        assert isinstance(grid, torch.Tensor)
+        types_lst = _per_item(kwargs[K_TYPES])
+        perm_lst = _per_item(kwargs[K_PERM])
+        num_items = len(patches_lst)
+        assert len(types_lst) == num_items and len(perm_lst) == num_items
+        assert grid.shape[0] == num_items
+
+        params = torch.stack(
+            [
+                self.image_start,
+                self.image_pad,
+                self.image_pad,
+                self.image_newline,
+                self.image_end,
+            ]
+        )
+        out: list[torch.Tensor] = []
+        for i in range(num_items):
+            n_vit_h, n_vit_w, _n_llm_h, _n_llm_w, _tl, _pl = (
+                int(v) for v in grid[i].tolist()
+            )
+            patches = patches_lst[i]
+            feats = self._encode_image(patches, n_vit_h, n_vit_w)
+            types = types_lst[i].to(device=feats.device, dtype=torch.long)
+            perm = perm_lst[i].to(device=feats.device, dtype=torch.long)
+            block = params[types]
+            image_rows = types == IMAGE
+            block[image_rows] = feats[perm].to(block.dtype)
+            out.append(block)
+        return out
 
     def make_empty_intermediate_tensors(
         self,
@@ -1362,6 +1644,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
+
+        # Vision-Exp: publish per-token image-span visibility counts for the
+        # sparse-MLA prefill combine kernel (consumed through the forward
+        # context by flashmla/cache_utils). Pure-GPU compute, no host sync;
+        # all-zeros on text-only steps. Text-only 0731 configs never set it.
+        if (
+            self.vision_enabled
+            and input_ids is not None
+            and is_forward_context_available()
+        ):
+            get_forward_context().dsv4_image_visible = get_image_visible_torch(
+                input_ids, self.vocab_size, self.max_image_tokens
+            )
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
@@ -1544,7 +1839,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
+                # Vision-Exp: the vision tower's mlp.w1/w2 names must NOT be
+                # treated as shared-expert gate_up_proj shards.
                 if ".experts." in name:
+                    continue
+                if ".vision." in name or ".aligner." in name:
                     continue
                 if weight_name not in name:
                     continue
@@ -1671,41 +1970,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
 
 
-def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
-    if expert_dtype == "fp4":
-        # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
-        # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
-        # shared experts use Fp8LinearMethod's block scales, which
-        # register as ``weight_scale_inv``.
-        scale_regex = {
-            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-        }
-    else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
-        scale_regex = {
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-        }
-    return WeightsMapper(
-        orig_to_new_prefix={
-            "layers.": "model.layers.",
-            "embed.": "model.embed.",
-            "norm.": "model.norm.",
-            "hc_head": "model.hc_head",
-            "mtp.": "model.mtp.",
-        },
-        orig_to_new_regex=scale_regex,
-        orig_to_new_suffix={
-            "head.weight": "lm_head.weight",
-            "embed.weight": "embed_tokens.weight",
-            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-        },
-        orig_to_new_substr={
-            ".shared_experts.w2": ".shared_experts.down_proj",
-        },
-    )
+# The mapper factory lives in deepseek_v4/weights.py so it can be
+# unit-tested without importing this (CUDA-heavy) module.
+_make_deepseek_v4_weights_mapper = make_deepseek_v4_weights_mapper
 
 
 class DeepseekV4MixtureOfExperts(MixtureOfExperts):
@@ -1745,14 +2012,34 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
+@MULTIMODAL_REGISTRY.register_processor(
+    DeepseekV4VisionMultiModalProcessor,
+    info=DeepseekV4VisionProcessingInfo,
+    dummy_inputs=DeepseekV4VisionDummyInputsBuilder,
+)
 class DeepseekV4ForCausalLM(
-    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
+    nn.Module,
+    SupportsPP,
+    SupportsEagle3,
+    DeepseekV4MixtureOfExperts,
+    SupportsMultiModal,
 ):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
     # Overridden per-instance in __init__ when expert_dtype != "fp4".
     hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
+
+    # The sparse-MLA hash-MoE routing and image visibility need the raw
+    # (possibly synthetic image) token ids even when multimodal embeddings
+    # drive the model input.
+    requires_raw_input_tokens: bool = True
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality == "image":
+            return IMAGE_PLACEHOLDER
+        return None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1779,6 +2066,11 @@ class DeepseekV4ForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
 
+        # Vision-Exp: image block positions carry synthetic ids
+        # (vocab_size + type) in the token stream; the model's
+        # embed_input_ids masks them out of the vocabulary lookup directly.
+        self._has_oov_mm_tokens = self.model.vision_enabled
+
         self.set_moe_parameters()
 
     def set_moe_parameters(self) -> None:
@@ -1800,8 +2092,21 @@ class DeepseekV4ForCausalLM(
         self.num_moe_layers = len(self.moe_layers)
         self.extract_moe_parameters(example_moe)
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model.embed_input_ids(
+            input_ids,
+            multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        return self.model.embed_multimodal(**kwargs)
 
     def compute_logits(
         self,

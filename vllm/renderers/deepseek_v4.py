@@ -3,6 +3,7 @@
 
 from vllm.config import VllmConfig
 from vllm.entrypoints.chat_utils import (
+    MODALITY_PLACEHOLDERS_MAP,
     ChatCompletionMessageParam,
     ConversationMessage,
     parse_chat_messages,
@@ -15,6 +16,31 @@ from .base import BaseRenderer
 from .inputs import DictPrompt
 from .inputs.preprocess import parse_dec_only_prompt
 from .params import ChatParams
+
+# parse_chat_messages(content_format="string") inlines the framework's
+# generic "<##IMAGE##>" marker at each image position; DeepSeek's official
+# message encoding (encoding/encoding_dsv4.py,
+# ``distribute_image_placeholder``) uses ``<｜deepseek_image｜>`` instead.
+# Swap the markers before the chat template runs so the placeholder survives
+# tokenization as a single special token; the mm processor later expands
+# each placeholder into the full synthetic image block.
+#
+# NOTE: keep this constant in sync with IMAGE_PLACEHOLDER in
+# vllm/models/deepseek_v4/image_processing.py (the model package pulls in
+# CUDA/Triton modules, so it must not be imported from the renderer).
+IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+_FRAMEWORK_IMAGE_PLACEHOLDER = MODALITY_PLACEHOLDERS_MAP["image"]
+
+
+def _substitute_image_placeholders(
+    conversation: list[ConversationMessage],
+) -> None:
+    for msg in conversation:
+        content = msg.get("content")
+        if isinstance(content, str) and _FRAMEWORK_IMAGE_PLACEHOLDER in content:
+            msg["content"] = content.replace(
+                _FRAMEWORK_IMAGE_PLACEHOLDER, IMAGE_PLACEHOLDER
+            )
 
 
 class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
@@ -44,6 +70,7 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
             media_io_kwargs=params.media_io_kwargs,
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
+        _substitute_image_placeholders(conversation)
 
         prompt_raw = self._apply_chat_template(
             conversation=conversation,
@@ -71,6 +98,7 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
             media_io_kwargs=params.media_io_kwargs,
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
+        _substitute_image_placeholders(conversation)
 
         prompt_raw = await self._apply_chat_template_async(
             conversation=conversation,

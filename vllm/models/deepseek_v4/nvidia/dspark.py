@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -62,6 +63,7 @@ from .model import (
     DeepseekV4Model,
     DeepseekV4MoE,
     _select_dsv4_attn_cls,
+    get_image_visible_torch,
     make_deepseek_v4_expert_params_mapping,
 )
 
@@ -782,6 +784,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if getattr(self.config, "vision_n_layers", 0) > 0:
+            # Vision-Exp: synthetic image ids (vocab_size + type) never index
+            # the embedding table. The draft does not consume image embeddings
+            # directly (image content arrives via the target model's hidden
+            # states), so mask the sentinels out of the vocabulary lookup.
+            input_ids = input_ids.masked_fill(
+                input_ids >= self.config.vocab_size, 0
+            )
         return self.embed_tokens(input_ids)
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
@@ -902,8 +912,17 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             main_x = _linear_output(self.main_proj(hidden_states))
             main_x = self.main_norm(main_x)
 
+        if getattr(self.config, "vision_n_layers", 0) > 0 and (
+            is_forward_context_available()
+        ):
+            # Vision-Exp: the draft's sparse-MLA layers read image-span
+            # visibility from the forward context, same as the target model.
+            get_forward_context().dsv4_image_visible = get_image_visible_torch(
+                input_ids, self.config.vocab_size, self.config.vision_max_n_token
+            )
+
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_input_ids(input_ids)
         x = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual, post_mix, res_mix = None, None, None
@@ -1101,7 +1120,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
                     continue
-                if name.endswith(".ffn.gate.bias"):
+                if name.endswith(".ffn.gate.bias_vl"):
+                    # Vision-Exp routing bias lives on the gate as
+                    # ``e_score_correction_bias_vl``.
+                    name = name.replace(
+                        ".ffn.gate.bias_vl",
+                        ".ffn.gate.e_score_correction_bias_vl",
+                    )
+                elif name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias",
                         ".ffn.gate.e_score_correction_bias",

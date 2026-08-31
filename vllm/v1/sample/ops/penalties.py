@@ -28,6 +28,14 @@ def apply_all_penalties(
     # will be reworked anyhow.
     output_tokens_t.masked_fill_(output_tokens_t == -1, vocab_size)
 
+    # Models with out-of-vocabulary prompt tokens (e.g. DeepSeek V4
+    # Vision-Exp's synthetic image ids vocab_size+type) would otherwise
+    # overflow the (vocab_size + 1) bin-count buffer in apply_penalties.
+    # Clamp them onto the pad slot, which is sliced off afterwards, so they
+    # simply do not contribute to any penalty mask.
+    if prompt_token_ids.max() >= vocab_size:
+        prompt_token_ids = prompt_token_ids.clamp(max=vocab_size)
+
     return apply_penalties(
         logits,
         prompt_token_ids,

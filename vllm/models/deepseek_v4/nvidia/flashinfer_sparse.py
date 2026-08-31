@@ -792,6 +792,23 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     ) -> None:
         swa_only = self.compress_ratio <= 1
 
+        # Vision-Exp image spans need get_image_visible-aware SWA windows,
+        # which this FlashInfer sparse-MLA prefill does not implement. Fail
+        # loudly instead of silently dropping the image visibility semantics;
+        # use the default (FlashMLA/Triton sparse MLA) backend for vision.
+        dsv4_visible = getattr(
+            get_forward_context(), "dsv4_image_visible", None
+        )
+        if dsv4_visible is not None and (
+            int(dsv4_visible[0].max().item()) > 0
+            or int(dsv4_visible[1].max().item()) > 0
+        ):
+            raise NotImplementedError(
+                "DeepSeek V4 Vision-Exp image input is not supported on the "
+                "FLASHINFER_MLA_SPARSE_DSV4 attention backend; use the default "
+                "FlashMLA/Triton sparse-MLA backend (or FLASHMLA_SPARSE_DSV4)."
+            )
+
         num_prefills = swa_metadata.num_prefills
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens

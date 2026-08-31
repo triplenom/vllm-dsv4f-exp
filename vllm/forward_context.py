@@ -155,6 +155,14 @@ class ForwardContext:
     # the producer does not set it.
     is_padding: torch.Tensor | None = None
 
+    # DeepSeek V4 Vision-Exp only: per-token (left, right) image-span
+    # visibility counts (int32 tensors aligned with the flattened per-step
+    # token stream, decodes first), computed from the synthetic image token
+    # ids by DeepseekV4Model.forward. Consumed by the sparse-MLA prefill
+    # combine kernel to widen the SWA window across image spans. None for
+    # all other models (and for text-only DeepSeek V4 configs).
+    dsv4_image_visible: tuple[torch.Tensor, torch.Tensor] | None = None
+
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
 

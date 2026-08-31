@@ -306,6 +306,26 @@ class DeepseekV4FlashInferSM120DecodeAttention(DeepseekV4FlashMLAAttention):
     ) -> None:
         import vllm.envs as envs
 
+        # Vision-Exp: image spans need get_image_visible-aware SWA windows,
+        # which the packed SM120 prefill kernel does not implement. Keep decode
+        # through this class (image spans never occur at decode time) but run
+        # image-carrying prefill through the FlashMLA/Triton path instead.
+        dsv4_visible = getattr(get_forward_context(), "dsv4_image_visible", None)
+        if dsv4_visible is not None and (
+            int(dsv4_visible[0].max().item()) > 0
+            or int(dsv4_visible[1].max().item()) > 0
+        ):
+            super()._forward_prefill(
+                q,
+                positions,
+                compressed_k_cache,
+                swa_k_cache,
+                output,
+                attn_metadata,
+                swa_metadata,
+            )
+            return
+
         # Packed prefill is a default-on lever on top of the decode port; when
         # off, defer to the FlashMLA indexed-D512 prefill path byte-for-byte.
         if not envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL:

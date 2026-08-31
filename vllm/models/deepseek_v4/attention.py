@@ -233,6 +233,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
+        # Vision-Exp: image span visibility bound for SWA window indices.
+        # 0 on text-only (0731) configs: prefill indexing stays byte-identical.
+        self.max_image_tokens = (
+            getattr(config, "vision_max_n_token", 0)
+            if getattr(config, "vision_n_layers", 0) > 0
+            else 0
+        )
+
         # Padded Q head count is dictated by the platform subclass.
         self.padded_heads = self.get_padded_num_q_heads(self.n_local_heads)
         # Sink padded to the same head count, initialized to -inf (no sink

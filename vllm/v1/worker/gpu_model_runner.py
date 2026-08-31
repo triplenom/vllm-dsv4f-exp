@@ -3572,9 +3572,24 @@ class GPUModelRunner(
         # access that takes down every TP rank. Cheap: one extra bound on a
         # kernel that already runs.
         if self.speculative_config is not None:
-            self.input_ids.gpu[:num_input_tokens].clamp_(
-                min=0, max=self.model_config.get_vocab_size() - 1
-            )
+            vocab_size = self.model_config.get_vocab_size()
+            hf_config = self.model_config.hf_config
+            if (
+                getattr(hf_config, "model_type", None) == "deepseek_v4"
+                and getattr(hf_config, "vision_n_layers", 0) > 0
+            ):
+                # Vision-Exp: legitimate synthetic image ids occupy
+                # [vocab_size, vocab_size + 5); clamp everything else into
+                # the vocabulary exactly like the plain path below.
+                ids = self.input_ids.gpu[:num_input_tokens]
+                is_image = (ids >= vocab_size) & (ids < vocab_size + 5)
+                ids.copy_(
+                    torch.where(is_image, ids, ids.clamp(min=0, max=vocab_size - 1))
+                )
+            else:
+                self.input_ids.gpu[:num_input_tokens].clamp_(
+                    min=0, max=self.model_config.get_vocab_size() - 1
+                )
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
@@ -5713,6 +5728,12 @@ class GPUModelRunner(
             # the token at prompt index i+1 is the "sampled" token we want
             # to gather the logprob for.
             tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+            # DeepSeek V4 Vision-Exp prompts can carry synthetic image ids
+            # (vocab_size + type); gathering logprobs at those indices would
+            # read out of the vocab range. Clamp them: the logprob of an
+            # image position is not a meaningful quantity anyway.
+            if tgt_token_ids.max() >= logits.shape[-1]:
+                tgt_token_ids = tgt_token_ids.clamp(max=logits.shape[-1] - 1)
 
             # Compute prompt scores respecting logprobs_mode.
             # NOTE: prompt tokens skip sampling processors, so

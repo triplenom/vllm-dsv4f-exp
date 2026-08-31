@@ -716,9 +716,28 @@ def combine_topk_swa_indices(
     M: int,
     N: int,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    vision_left_pos: torch.Tensor | None = None,
+    vision_right_pos: torch.Tensor | None = None,
+    vision_max_n_token: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Combine compressed topk indices with the SWA window region.
+
+    ``vision_left_pos`` / ``vision_right_pos`` enable DeepSeek Vision-Exp
+    image visibility: per-token left/right span visibility counts (from
+    ``get_image_visible`` semantics) widen the causal SWA window back to a
+    span's IMAGE_START and bidirectionally up to its IMAGE_END. ``None``
+    (or ``vision_max_n_token == 0``) keeps the text-only behavior bit-exact.
+    """
+    if vision_max_n_token <= 0:
+        vision_left_pos = None
+        vision_right_pos = None
+    if vision_left_pos is None:
+        vision_right_pos = None
+        vision_max_n_token = 0
     num_tokens = topk_indices.shape[0]
-    combined_topk = sparse_prefill_combined_topk_size(topk, window_size)
+    combined_topk = sparse_prefill_combined_topk_size(
+        topk, window_size + vision_max_n_token
+    )
     if out is None:
         combined_indices = torch.full(
             (num_tokens, combined_topk),
@@ -746,6 +765,11 @@ def combine_topk_swa_indices(
         # real indices.
         combined_indices.fill_(-1)
 
+    if vision_left_pos is not None:
+        assert vision_left_pos.shape[0] >= num_tokens
+        assert vision_right_pos is not None
+        assert vision_right_pos.shape[0] >= num_tokens
+
     _COMBINE_TOPK_SWA_INDICES_KERNEL(
         combined_indices,
         combined_lens,
@@ -755,9 +779,12 @@ def combine_topk_swa_indices(
         gather_lens,
         M,
         N,
+        vision_left_pos,
+        vision_right_pos,
         TOP_K=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
+        VISION_MAX_N_TOKEN=vision_max_n_token,
     )
     return combined_indices, combined_lens
 
@@ -820,6 +847,8 @@ class CombineTopkSwaIndicesKernel(
         WINDOW_SIZE: int
         PADDED_TOP_K: int
         input_variant: TritonPointerInputVariant
+        VISION_MAX_N_TOKEN: int = 0
+        PADDED_SWA: int = 0
 
     @staticmethod
     @triton.jit(
@@ -841,10 +870,14 @@ class CombineTopkSwaIndicesKernel(
         gather_lens_ptr,
         M,
         N,
+        vision_left_pos_ptr,
+        vision_right_pos_ptr,
         TOP_K: tl.constexpr,
         COMPRESS_RATIO: tl.constexpr,
         WINDOW_SIZE: tl.constexpr,
         PADDED_TOP_K: tl.constexpr,
+        VISION_MAX_N_TOKEN: tl.constexpr,
+        PADDED_SWA: tl.constexpr,
     ):
         batch_idx = tl.program_id(0)
         worker_id = tl.program_id(1)
@@ -874,6 +907,25 @@ class CombineTopkSwaIndicesKernel(
             topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
             swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 
+            if VISION_MAX_N_TOKEN > 0:
+                # Vision-Exp image visibility (get_image_visible semantics):
+                # inside an [IMAGE_START, IMAGE_END] span the window reaches
+                # back to the span start when the span is longer than the
+                # window, and bidirectionally up to the span end. Text
+                # positions (left == right == 0) degrade to the plain causal
+                # window.
+                left = tl.load(vision_left_pos_ptr + token_idx)
+                right = tl.load(vision_right_pos_ptr + token_idx)
+                left_add = tl.maximum(left - (WINDOW_SIZE - 1), 0)
+                win_start = tl.minimum(
+                    pos - swa_len + 1, pos - (WINDOW_SIZE - 1) - left_add
+                )
+                swa_len = pos + right - win_start + 1
+                # Reload the causal window start for the store below.
+                pos_start = win_start
+            else:
+                pos_start = pos - swa_len + 1
+
             offset = tl.arange(0, PADDED_TOP_K)
             mask = offset < topk_len
             topk_indices = tl.load(
@@ -885,7 +937,7 @@ class CombineTopkSwaIndicesKernel(
                 topk_indices + M * batch_idx,
                 mask=mask,
             )
-            offset = tl.arange(0, WINDOW_SIZE)
+            offset = tl.arange(0, PADDED_SWA)
             # Index into gathered buffer: N + (position - gather_start)
             # For positions [pos - swa_len + 1, pos], the buffer indices are:
             # [N + pos - swa_len + 1 - gather_start, N + pos - gather_start]
@@ -894,7 +946,7 @@ class CombineTopkSwaIndicesKernel(
                 + token_idx * combined_indices_stride
                 + topk_len
                 + offset,
-                M * batch_idx + N + offset + pos - swa_len + 1 - gather_start,
+                M * batch_idx + N + offset + pos_start - gather_start,
                 mask=offset < swa_len,
             )
 
@@ -912,6 +964,7 @@ class CombineTopkSwaIndicesKernel(
         topk: int,
         compress_ratio: int,
         WINDOW_SIZE: int,
+        VISION_MAX_N_TOKEN: int = 0,
     ) -> CompileKey:
         padded_topk = next_power_of_2(topk_width)
         input_variant = TritonPointerInputVariant.from_alignment(
@@ -926,6 +979,8 @@ class CombineTopkSwaIndicesKernel(
             WINDOW_SIZE=WINDOW_SIZE,
             PADDED_TOP_K=padded_topk,
             input_variant=input_variant,
+            VISION_MAX_N_TOKEN=VISION_MAX_N_TOKEN,
+            PADDED_SWA=next_power_of_2(WINDOW_SIZE + VISION_MAX_N_TOKEN),
         )
 
     def get_warmup_keys(self, vllm_config: Any) -> list[CompileKey]:
@@ -933,10 +988,12 @@ class CombineTopkSwaIndicesKernel(
             return []
 
         window_size = _hf_config_int(vllm_config, "sliding_window", 128)
+        vision_max_n_token = _hf_config_int(vllm_config, "vision_max_n_token", 0)
         return self._trace_dispatch(self.dispatch)(
             _DSV4_COMBINE_TOPK_SWA_WARMUP_INPUTS,
             _COMBINE_TOPK_SWA_POINTER_INPUTS,
             WINDOW_SIZE=window_size,
+            VISION_MAX_N_TOKEN=vision_max_n_token,
         )
 
     def compile(self, compile_key: CompileKey) -> None:
@@ -955,10 +1012,15 @@ class CombineTopkSwaIndicesKernel(
             input_variant.pointer("gather_lens", torch.int32),
             1,  # do not specialize M
             1,  # do not specialize N
+            # Vision-Exp placeholder pointers (unspecialized, like above)
+            int32_ptr,
+            int32_ptr,
             TOP_K=compile_key.TOP_K,
             COMPRESS_RATIO=compile_key.COMPRESS_RATIO,
             WINDOW_SIZE=compile_key.WINDOW_SIZE,
             PADDED_TOP_K=compile_key.PADDED_TOP_K,
+            VISION_MAX_N_TOKEN=compile_key.VISION_MAX_N_TOKEN,
+            PADDED_SWA=compile_key.PADDED_SWA,
             grid=(1, _COMBINE_TOPK_SWA_NUM_WORKERS),
         )
 
@@ -972,10 +1034,13 @@ class CombineTopkSwaIndicesKernel(
         gather_lens: torch.Tensor,
         M: int,
         N: int,
+        vision_left_pos: torch.Tensor | None,
+        vision_right_pos: torch.Tensor | None,
         *,
         TOP_K: int,
         COMPRESS_RATIO: int,
         WINDOW_SIZE: int,
+        VISION_MAX_N_TOKEN: int = 0,
     ) -> None:
         num_reqs = seq_lens.shape[0]
         self.kernel[(num_reqs, _COMBINE_TOPK_SWA_NUM_WORKERS)](
@@ -989,10 +1054,14 @@ class CombineTopkSwaIndicesKernel(
             gather_lens,
             M,
             N,
+            vision_left_pos,
+            vision_right_pos,
             TOP_K=TOP_K,
             COMPRESS_RATIO=COMPRESS_RATIO,
             WINDOW_SIZE=WINDOW_SIZE,
             PADDED_TOP_K=next_power_of_2(topk_indices.shape[-1]),
+            VISION_MAX_N_TOKEN=VISION_MAX_N_TOKEN,
+            PADDED_SWA=next_power_of_2(WINDOW_SIZE + VISION_MAX_N_TOKEN),
         )
 
 

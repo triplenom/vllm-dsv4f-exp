@@ -220,7 +220,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
 
         combined_topk = sparse_prefill_combined_topk_size(
             cls._prefill_workspace_topk_bound(layer),
-            window_size,
+            window_size + getattr(layer, "max_image_tokens", 0),
         )
         specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((layer.PREFILL_CHUNK_SIZE, m_bound, head_dim), torch.bfloat16),
@@ -970,6 +970,15 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         )
         assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
 
+        # Vision-Exp: per-token image span visibility (left/right counts,
+        # full-batch token aligned). Present only for vision-enabled configs.
+        dsv4_visible = getattr(
+            get_forward_context(), "dsv4_image_visible", None
+        )
+        vision_max_n_token = (
+            self.max_image_tokens if dsv4_visible is not None else 0
+        )
+
         max_query_chunk_tokens = 0
         for chunk_start, chunk_end, _chunk_n, _chunk_m in chunk_plan:
             query_start = (
@@ -981,7 +990,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             max_query_chunk_tokens = max(
                 max_query_chunk_tokens, int(query_end - query_start)
             )
-        combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
+        combined_topk = sparse_prefill_combined_topk_size(
+            top_k, self.window_size + vision_max_n_token
+        )
 
         workspace_manager = current_workspace_manager()
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
@@ -1115,6 +1126,16 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
+            vis_left_chunk = None
+            vis_right_chunk = None
+            if dsv4_visible is not None:
+                vis_left_chunk = dsv4_visible[0][
+                    num_decode_tokens + query_start : num_decode_tokens + query_end
+                ]
+                vis_right_chunk = dsv4_visible[1][
+                    num_decode_tokens + query_start : num_decode_tokens + query_end
+                ]
+
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
                 query_start_loc[
@@ -1128,6 +1149,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 chunk_m,
                 chunk_n,
                 out=(combined_indices_buffer, combined_lens_buffer),
+                vision_left_pos=vis_left_chunk,
+                vision_right_pos=vis_right_chunk,
+                vision_max_n_token=vision_max_n_token,
             )
             if triton_sparse_mla_enabled:
                 self._forward_sparse_mla_prefill_triton(
