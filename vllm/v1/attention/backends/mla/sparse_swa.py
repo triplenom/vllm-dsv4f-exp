@@ -17,6 +17,9 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import is_dsv4_sm120_fi_prefill_active
 from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_dspark_swa_index_width,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -178,8 +181,12 @@ class DeepseekSparseSWAMetadata:
 
     is_valid_token: torch.Tensor | None = None  # [num_tokens]
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
-    decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, window_size]
+    decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, width]
     decode_swa_lens: torch.Tensor | None = None  # [num_decode_tokens]
+    # Dense width of decode_swa_indices: window_size (causal) or the padded
+    # noncausal_index_width (DSpark non-causal draft). Consumers that dispatch
+    # into width-specialized kernels must use this, not window_size.
+    decode_swa_width: int = 0
     # Paged-coordinate prefill SWA indices/lens (FP8 paged-direct prefill).
     prefill_swa_indices: torch.Tensor | None = (
         None  # [num_prefill_tokens, 1, window_size]
@@ -494,12 +501,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # DSpark draft: the block is non-causal (every query attends to the
         # trailing window of context PLUS all query tokens, including future ones),
-        # so its per-token index list is wider than `window_size`. The kernel pads
-        # the q-head count to B_TOPK (64/128), which requires the index width to be
-        # a multiple of 128.
+        # so its per-token index list is wider than `window_size`. Pad to a
+        # kernel-supported width (64-entry tiles after
+        # flashinfer-ai/flashinfer#4380) instead of a multiple of 128; the
+        # logical SWA window stays unchanged when the padded matrix is built.
         self.is_dspark = spec_config is not None and spec_config.use_dspark()
         self.noncausal_index_width = (
-            cdiv(self.window_size + self.num_speculative_tokens, 128) * 128
+            get_dspark_swa_index_width(
+                self.window_size,
+                self.num_speculative_tokens,
+            )
             if self.is_dspark
             else 0
         )
@@ -550,6 +561,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # Compute SWA window indices/lens for the decode rows once per step.
         non_causal = not common_attn_metadata.causal
+        decode_swa_width = (
+            self.noncausal_index_width if non_causal else self.window_size
+        )
         decode_swa_indices = self.decode_swa_indices
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
@@ -661,6 +675,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             token_to_req_indices=token_to_req_indices,
             decode_swa_indices=decode_swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
+            decode_swa_width=decode_swa_width,
             prefill_swa_indices=(
                 self.prefill_swa_indices[:num_prefill_tokens]
                 if want_prefill_swa

@@ -3,6 +3,24 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
+
+_DSPARK_SWA_INDEX_ALIGNMENT = 64
+
+
+def get_dspark_swa_index_width(
+    window_size: int,
+    num_speculative_tokens: int,
+) -> int:
+    """Return the padded width of non-causal DSpark SWA indices.
+
+    The SM120 sparse-MLA kernels consume 64-entry tiles, so padding to
+    a multiple of 64 (instead of 128) maps the DSpark K<=5 shape
+    (128 sliding-window entries plus up to ~7 draft entries) onto the
+    192-wide bucket rather than 256 (flashinfer-ai/flashinfer#4380).
+    """
+    width = max(int(window_size), 0) + max(int(num_speculative_tokens), 0)
+    return cdiv(width, _DSPARK_SWA_INDEX_ALIGNMENT) * _DSPARK_SWA_INDEX_ALIGNMENT
 
 
 @triton.jit

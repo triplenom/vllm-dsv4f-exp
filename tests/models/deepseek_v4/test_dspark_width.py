@@ -186,3 +186,28 @@ def test_dspark_exempt_from_mtp_n_predict_divisibility():
     idx = src.index("must be divisible by {n_predict=}")
     window = src[max(0, idx - 800) : idx]
     assert 'self.method != "dspark"' in window
+
+@pytest.mark.parametrize(
+    ("window_size", "num_speculative_tokens", "expected_width"),
+    [
+        (128, 3, 192),
+        (128, 4, 192),
+        (128, 5, 192),
+        (128, 6, 192),
+        (128, 64, 192),
+        (128, 65, 256),
+    ],
+)
+def test_dspark_swa_index_width_alignment(
+    window_size, num_speculative_tokens, expected_width
+):
+    """The DSpark SWA index width calculation must align to 64 (PR #51538 / fc457af)
+    so that K in {3, 4, 5, 6} maps to width 192 instead of expanding to 256."""
+    from vllm.v1.attention.backends.mla.compressor_utils import (
+        get_dspark_swa_index_width,
+    )
+
+    assert (
+        get_dspark_swa_index_width(window_size, num_speculative_tokens)
+        == expected_width
+    )
