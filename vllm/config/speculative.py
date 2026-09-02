@@ -1104,27 +1104,27 @@ class SpeculativeConfig:
                     )
 
                 if self.method == "dspark":
-                    # Upstream removed its own nst-vs-block assertion in #50869
-                    # ("invalid assertion added erroneously"), and it was right
-                    # that erroring on nst > block_size is wrong: two users on
-                    # vllm-project/vllm#41834 run nst=7 against block_size=5 and
-                    # it demonstrably works -- b0bh00d's /metrics shows a normal
-                    # accept curve. Our previous `==` guard would have rejected
-                    # their configs at startup.
-                    #
-                    # But the two directions are not symmetric, so this keeps the
-                    # half that upstream's deletion also drops:
-                    #   nst < block  -- the drafter emits one block per pass;
-                    #                   fewer tokens feed the block / Markov-head
-                    #                   machinery an unsupported layout and
-                    #                   garble output. Still an error.
-                    #   nst > block  -- works, but drafts tokens that are never
-                    #                   accepted. Measured on 2x GB10 (SM121a),
-                    #                   DeepSeek-V4-Flash-0731, block_size=5:
-                    #                     probabilistic  nst=5: 2.19  nst=7: 2.03
-                    #                     greedy         nst=5: 2.11  nst=7: 1.75
-                    #                   positions 5 and 6 accepted 0.000 in every
-                    #                   sample. A warning, not an error.
+                    # dspark_block_size is the DRAFT's internal attention block
+                    # width (the checkpoint's trained block layout), NOT a
+                    # minimum for num_speculative_tokens. The draft model pads
+                    # the flat token stream up to a whole number of blocks
+                    # with the noise token and returns exactly the requested
+                    # rows, and the sampler/verification paths consume exactly
+                    # num_speculative_tokens positions per request, so widths
+                    # below or above the checkpoint block size produce correct
+                    # output. num_speculative_tokens == dspark_block_size (or
+                    # a multiple) keeps request boundaries aligned with the
+                    # draft's attention blocks; other widths let blocks
+                    # straddle requests when batch > 1, which can degrade
+                    # draft acceptance for the straddled blocks but never
+                    # changes final output (rejection sampling still decides).
+                    # Empirics:
+                    #   2x RTX PRO 6000 (SM120), DeepSeek-V4-Flash-Vision-Exp,
+                    #   block_size=5, nst=6: nonzero sixth-position acceptance
+                    #   (so positions beyond the block width CAN be accepted).
+                    #   2x GB10 (SM121a), DeepSeek-V4-Flash-0731, block_size=5:
+                    #     probabilistic  nst=5: 2.19  nst=7: 2.03
+                    #     greedy         nst=5: 2.11  nst=7: 1.75
                     dspark_block_size = getattr(
                         self.draft_model_config.hf_config,
                         "dspark_block_size",
@@ -1132,25 +1132,22 @@ class SpeculativeConfig:
                     )
                     if dspark_block_size is not None:
                         if self.num_speculative_tokens < dspark_block_size:
-                            raise ValueError(
-                                "DSpark requires num_speculative_tokens >= "
-                                f"dspark_block_size ({dspark_block_size}); got "
-                                f"{self.num_speculative_tokens}. Smaller values "
-                                "produce incorrect output, not merely lower "
-                                f"acceptance. Use "
-                                f"num_speculative_tokens={dspark_block_size}."
+                            logger.warning_once(
+                                "num_speculative_tokens=%d is below the "
+                                "checkpoint DSpark block size (%d); the draft "
+                                "pads each pass up to a full block, so this "
+                                "configuration is valid, but acceptance and "
+                                "throughput may be affected.",
+                                self.num_speculative_tokens,
+                                dspark_block_size,
                             )
                         if self.num_speculative_tokens > dspark_block_size:
                             logger.warning_once(
-                                "DSpark drafts exactly one block of %d tokens "
-                                "per pass, so num_speculative_tokens=%d drafts "
-                                "%d token(s) that can never be accepted. On "
-                                "2x GB10 this lowered mean acceptance length "
-                                "(2.19 -> 2.03 probabilistic, 2.11 -> 1.75 "
-                                "greedy). Consider num_speculative_tokens=%d.",
-                                dspark_block_size,
+                                "num_speculative_tokens=%d exceeds the "
+                                "checkpoint DSpark block size (%d); positions "
+                                "beyond the block width typically have lower "
+                                "acceptance.",
                                 self.num_speculative_tokens,
-                                self.num_speculative_tokens - dspark_block_size,
                                 dspark_block_size,
                             )
 
