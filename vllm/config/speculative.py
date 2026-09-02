@@ -1080,10 +1080,15 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        self.method != "dspark"
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
-                        # Ensure divisibility for MTP module reuse.
+                        # Ensure divisibility for MTP module reuse. DSpark is
+                        # exempt: its draft model runs ALL of its layers on
+                        # every pass (there is no per-step MTP module reuse),
+                        # so the n_predict relationship does not constrain
+                        # DSpark's speculative width.
                         raise ValueError(
                             f"num_speculative_tokens:{self.num_speculative_tokens}"
                             f" must be divisible by {n_predict=}"

@@ -174,3 +174,15 @@ def test_dspark_width_validation_no_hard_minimum():
     assert "produce incorrect output" not in src
     assert "can never be accepted" not in src
     assert "is below the " in src and "checkpoint DSpark block size" in src
+
+
+def test_dspark_exempt_from_mtp_n_predict_divisibility():
+    """The n_predict divisibility check exists for MTP per-step module reuse.
+    The DSpark draft runs ALL layers per pass (proven by
+    models/deepseek_v4/nvidia/dspark.py's full layer loop), so the check must
+    not be applied to method='dspark' (it would spuriously reject K5 on
+    Vision-Exp whose num_nextn_predict_layers=3)."""
+    src = SPECULATIVE_PATH.read_text(encoding="utf-8")
+    idx = src.index("must be divisible by {n_predict=}")
+    window = src[max(0, idx - 800) : idx]
+    assert 'self.method != "dspark"' in window
