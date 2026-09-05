@@ -643,12 +643,21 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         q_lens: list[int],
         topk_per_req: list[torch.Tensor],
         dense_mask: torch.Tensor | None = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+        max_query_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.dcp_world_size > 1:
             raise NotImplementedError(
                 "Masked MHA with context does not yet support decode context "
                 "parallelism"
             )
+
+        # Fall back to the metadata values when the caller did not supply the
+        # (already-zero-query-filtered) batch tensors.
+        if cu_seqlens_q is None:
+            cu_seqlens_q = prefill_metadata.query_start_loc
+        if max_query_len is None:
+            max_query_len = prefill_metadata.max_query_len
 
         chunked_context = prefill_metadata.chunked_context
         assert chunked_context is not None
@@ -689,9 +698,9 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 q=q,
                 k=k,
                 v=v,
-                cu_seqlens_q=prefill_metadata.query_start_loc,
+                cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=chunked_context.cu_seq_lens[i],
-                max_seqlen_q=prefill_metadata.max_query_len,
+                max_seqlen_q=max_query_len,
                 max_seqlen_k=chunked_context.max_seq_lens[i],
                 topk_per_req=chunk_topk,
                 q_lens=q_lens,
@@ -754,6 +763,39 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         assert self.topk_indices_buffer is not None
 
         q_lens = prefill_metadata.query_lens_cpu.tolist()
+        # Skip empty query ranges: FULL_AND_PIECEWISE CUDA-graph padding, or a
+        # CPU-KV-restore step that schedules a prefill-phase request with 0 new
+        # tokens, can produce a prefill request/chunk with query_start ==
+        # query_end. An empty query range must never reach FlashInfer
+        # (upstream #49059 / commit 34020ad).
+        q_lens = [q_len for q_len in q_lens if q_len > 0]
+        if not q_lens:
+            # All prefill queries are empty; nothing to compute for the sparse
+            # MLA prefill backend.
+            return
+        # Rebuild the cumulative query lengths and max query length for the
+        # filtered batch so no zero-length segment is handed to FlashInfer.
+        # Zero-length prefill requests contribute no rows to q/k/v, so the
+        # filtered arrays stay aligned with the already-built tensors.
+        prefill_qsl = prefill_metadata.query_start_loc
+        if len(q_lens) != prefill_metadata.query_lens_cpu.numel():
+            with torch.no_grad():
+                cu_prefill = torch.cumsum(
+                    torch.tensor(
+                        q_lens,
+                        dtype=prefill_qsl.dtype,
+                        device=prefill_qsl.device,
+                    ),
+                    dim=0,
+                )
+                base = (
+                    prefill_qsl[0].item() if prefill_qsl.numel() > 0 else 0
+                )
+                filtered_qsl = cu_prefill + base
+            filtered_max_qlen = max(q_lens)
+        else:
+            filtered_qsl = prefill_qsl
+            filtered_max_qlen = prefill_metadata.max_query_len
         num_decode_tokens = attn_metadata.num_decode_tokens  # type: ignore[attr-defined]
         topk_all = self.topk_indices_buffer[
             num_decode_tokens : num_decode_tokens + q.shape[0]
@@ -767,10 +809,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 q=q,
                 k=k,
                 v=v,
-                cu_seqlens_q=prefill_metadata.query_start_loc,
-                cu_seqlens_k=prefill_metadata.query_start_loc,
-                max_seqlen_q=prefill_metadata.max_query_len,
-                max_seqlen_k=prefill_metadata.max_query_len,
+                cu_seqlens_q=filtered_qsl,
+                cu_seqlens_k=filtered_qsl,
+                max_seqlen_q=filtered_max_qlen,
+                max_seqlen_k=filtered_max_qlen,
                 topk_per_req=topk_per_req,
                 q_lens=q_lens,
                 causal=True,
@@ -784,7 +826,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         dense_mask = self._try_build_global_mask(
             topk_per_req,
             q_lens,
-            prefill_metadata.max_query_len,
+            filtered_max_qlen,
             prefill_max_seq_len,
             prefill_metadata.topk_mask_workspace,
         )
@@ -796,10 +838,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=prefill_metadata.query_start_loc,
-            cu_seqlens_k=prefill_metadata.query_start_loc,
-            max_seqlen_q=prefill_metadata.max_query_len,
-            max_seqlen_k=prefill_metadata.max_query_len,
+            cu_seqlens_q=filtered_qsl,
+            cu_seqlens_k=filtered_qsl,
+            max_seqlen_q=filtered_max_qlen,
+            max_seqlen_k=filtered_max_qlen,
             topk_per_req=suffix_topk,
             q_lens=q_lens,
             causal=True,
@@ -818,6 +860,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             q_lens=q_lens,
             topk_per_req=topk_per_req,
             dense_mask=dense_mask,
+            cu_seqlens_q=filtered_qsl,
+            max_query_len=filtered_max_qlen,
         )
         merge_attn_states(
             output=output.view(-1, self.num_heads, self.v_head_dim),
