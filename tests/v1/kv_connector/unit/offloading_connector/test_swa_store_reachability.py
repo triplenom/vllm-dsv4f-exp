@@ -177,3 +177,37 @@ def test_active_decode_does_not_advance_swa_final_horizon(request_runner):
     stored = _stored_swa_chunks(runner)
     first_decode_chunk = prompt_tokens // SWA_BLOCK_SIZE
     assert first_decode_chunk not in stored
+
+
+def test_compact_store_plan_has_no_duplicate_physical_blocks(request_runner):
+    """A valid reachable SWA store plan must not reuse one physical GPU block for
+    distinct logical chunks, i.e. no harmful duplicate descriptors within a single
+    store job. The corrected #54362 reachability selects a deterministic chunk set
+    per request, so a fresh-request store plan contains no duplicate block id."""
+    num_tokens = 1200
+    runner = _run_prefill(
+        request_runner, num_tokens, abort_after_first=False, async_scheduling=False
+    )
+    for transfer in runner.completed_stores:
+        swa_offsets = [
+            block.request_block_offset
+            for block in transfer.gpu_blocks
+            if block.group_idx == 1
+        ]
+        assert len(set(swa_offsets)) == len(swa_offsets), (
+            "duplicate physical GPU block in a single SWA store plan"
+        )
+
+
+def test_final_store_not_lost_when_request_finishes(request_runner):
+    """The final eligible prompt chunks of the last (partial) alignment segment are
+    stored when the request finishes, so no reachable prompt chunk is lost."""
+    num_tokens = 1200
+    store_horizon_chunks = num_tokens // SWA_BLOCK_SIZE
+    runner = _run_prefill(
+        request_runner, num_tokens, abort_after_first=False, async_scheduling=False
+    )
+    stored = set(_stored_swa_chunks(runner))
+    # The final partial segment tail must be present.
+    expected = set(_expected_swa_chunks(store_horizon_chunks))
+    assert expected.issubset(stored), "final eligible prompt chunks were not stored"
