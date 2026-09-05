@@ -1047,15 +1047,53 @@ class OffloadingConnectorScheduler:
                 req_status, num_tokens_after_batch
             )
 
+            # During active prompt prefill, the load path can later request SWA
+            # tail chunks that only become reachable at the FINAL prompt
+            # horizon. Evaluating SWA reachability against the current
+            # intermediate chunked-prefill frontier treats each step as the
+            # final partial segment and both stores unreachable chunks and
+            # misses the final reachable tail (upstream #54362). Project the
+            # final intended prompt horizon instead; once the request finishes
+            # or aborts, treat the actually computed frontier as the final
+            # horizon and reconsider previously-skipped SWA chunks.
+            is_prefill_active = (not req.is_finished()) and (
+                num_tokens_after_batch <= req.num_prompt_tokens
+            )
+            final_prompt_offloadable_tokens = 0
+            if is_prefill_active:
+                final_prompt_offloadable_tokens = self._calc_num_offloadable_tokens(
+                    req_status, req.num_prompt_tokens
+                )
+            reconsider_from_start = (
+                req.is_finished() or req.status is RequestStatus.FINISHED_ABORTED
+            )
+
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if (
+                    reconsider_from_start
+                    and group_config.sliding_window_size_in_chunks is not None
+                ):
+                    # The actual (possibly partial) frontier is now final, so
+                    # re-scan from the start and let the cache dedup guard
+                    # against resubmitting chunks that were already stored.
+                    group_state.next_stored_chunk_idx = 0
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )
+
+                # Horizon used for SWA store reachability.
+                if is_prefill_active:
+                    reachability_chunks = (
+                        final_prompt_offloadable_tokens
+                        // group_config.tokens_per_chunk
+                    )
+                else:
+                    reachability_chunks = num_chunks
 
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 if num_chunks <= start_chunk_idx:
@@ -1086,7 +1124,7 @@ class OffloadingConnectorScheduler:
                     abs_chunk_idx = start_chunk_idx + key_idx
                     if not is_store_reachable_swa_chunk(
                         abs_chunk_idx,
-                        num_chunks,
+                        reachability_chunks,
                         group_config.alignment_chunk_count,
                         group_config.sliding_window_size_in_chunks,
                         group_config.is_eagle_group,
