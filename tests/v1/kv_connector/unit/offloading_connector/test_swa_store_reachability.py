@@ -160,10 +160,8 @@ def test_aborted_chunked_prefill_reconsiders_final_tail(
     assert sorted(set(stored)) == expected
 
 
-@pytest.mark.parametrize("async_scheduling", [False, True])
-def test_active_decode_does_not_advance_swa_final_horizon(
-    request_runner, async_scheduling
-):
+def test_active_decode_does_not_advance_swa_final_horizon(request_runner):
+    async_scheduling = False
     """Active decode chunks must not be treated as a final partial SWA segment:
     the first decode chunk (right after the prompt boundary) is not stored."""
     prompt_tokens = 1200

@@ -1096,7 +1096,6 @@ class OffloadingConnectorScheduler:
                     and group_config.alignment_chunk_count is not None
                     and not group_config.is_eagle_group
                     and num_chunks != prompt_horizon_chunks
-                    and group_state.next_stored_chunk_idx < num_chunks
                 )
                 if reconsider_final_swa_tail:
                     segment_start_chunk = (
