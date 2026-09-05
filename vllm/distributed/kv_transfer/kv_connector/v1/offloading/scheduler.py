@@ -121,20 +121,30 @@ def get_sliding_window_size_in_chunks(
 
 def is_store_reachable_swa_chunk(
     absolute_chunk_index: int,
-    storable_chunk_count: int,
+    storable_chunk_count: int | None,
     alignment_chunk_count: int | None,
     sliding_window_chunks: int | None,
     is_eagle_group: bool,
 ) -> bool:
-    """Return whether an SWA chunk can participate in an external-cache hit."""
+    """Return whether an SWA chunk can participate in an external-cache hit.
+
+    ``storable_chunk_count`` is the request horizon used to resolve the final
+    (possibly partial) alignment segment. ``None`` means there is no final
+    prompt-segment horizon (e.g. an active decode frontier or a retention /
+    EAGLE group): every segment is then treated as a full alignment segment and
+    only the fixed per-segment reachable tail is kept.
+    """
     if alignment_chunk_count is None:
         return True
     assert sliding_window_chunks is not None
     position_in_segment = absolute_chunk_index % alignment_chunk_count
     segment_start = absolute_chunk_index - position_in_segment
-    actual_segment_length = min(
-        alignment_chunk_count, storable_chunk_count - segment_start
-    )
+    if storable_chunk_count is None:
+        actual_segment_length = alignment_chunk_count
+    else:
+        actual_segment_length = min(
+            alignment_chunk_count, storable_chunk_count - segment_start
+        )
     reachable_tail = sliding_window_chunks + int(is_eagle_group)
     return position_in_segment >= actual_segment_length - reachable_tail
 
@@ -1056,16 +1066,9 @@ class OffloadingConnectorScheduler:
             # final intended prompt horizon instead; once the request finishes
             # or aborts, treat the actually computed frontier as the final
             # horizon and reconsider previously-skipped SWA chunks.
-            is_prefill_active = (not req.is_finished()) and (
-                num_tokens_after_batch <= req.num_prompt_tokens
-            )
-            final_prompt_offloadable_tokens = 0
-            if is_prefill_active:
-                final_prompt_offloadable_tokens = self._calc_num_offloadable_tokens(
-                    req_status, req.num_prompt_tokens
-                )
-            reconsider_from_start = (
-                req.is_finished() or req.status is RequestStatus.FINISHED_ABORTED
+            # Offloadable token count at the FINAL prompt horizon.
+            prompt_offloadable_tokens = self._calc_num_offloadable_tokens(
+                req_status, req.num_prompt_tokens
             )
 
             # Filter out chunks skipped due to sliding window attention / SSM
@@ -1074,26 +1077,52 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
-                if (
-                    reconsider_from_start
-                    and group_config.sliding_window_size_in_chunks is not None
-                ):
-                    # The actual (possibly partial) frontier is now final, so
-                    # re-scan from the start and let the cache dedup guard
-                    # against resubmitting chunks that were already stored.
-                    group_state.next_stored_chunk_idx = 0
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )
+                prompt_horizon_chunks = (
+                    prompt_offloadable_tokens // group_config.tokens_per_chunk
+                )
 
-                # Horizon used for SWA store reachability.
-                if is_prefill_active:
-                    reachability_chunks = (
-                        final_prompt_offloadable_tokens
-                        // group_config.tokens_per_chunk
+                # A request whose actual computed final frontier differs from
+                # the projected prompt horizon (e.g. aborted prefill, or a
+                # finished partial prompt) must re-scan the final alignment
+                # segment so its reachable tail becomes storable under the
+                # real horizon. Re-scan only from that segment's start, not
+                # from chunk 0, so already-stored chunks are not re-issued.
+                reconsider_final_swa_tail = (
+                    (req.is_finished() or req.status is RequestStatus.FINISHED_ABORTED)
+                    and group_config.sliding_window_size_in_chunks is not None
+                    and group_config.alignment_chunk_count is not None
+                    and not group_config.is_eagle_group
+                    and num_chunks != prompt_horizon_chunks
+                    and group_state.next_stored_chunk_idx < num_chunks
+                )
+                if reconsider_final_swa_tail:
+                    segment_start_chunk = (
+                        num_chunks
+                        - num_chunks % group_config.alignment_chunk_count
                     )
-                else:
+                    group_state.next_stored_chunk_idx = min(
+                        group_state.next_stored_chunk_idx, segment_start_chunk
+                    )
+
+                # Horizon used for SWA store reachability. During active prompt
+                # prefill project the FINAL prompt horizon so the final partial
+                # prompt segment's reachable tail is pre-stored. Once the
+                # request finishes/aborts, use the actually computed frontier.
+                # An EAGLE/MTP group, and an active decode frontier (num_chunks
+                # past the prompt horizon), have no final prompt-segment
+                # horizon, so only fixed per-segment tails are kept (upstream
+                # #54362).
+                if group_config.is_eagle_group:
+                    reachability_chunks = None
+                elif req.is_finished() or req.status is RequestStatus.FINISHED_ABORTED:
                     reachability_chunks = num_chunks
+                elif num_chunks <= prompt_horizon_chunks:
+                    reachability_chunks = prompt_horizon_chunks
+                else:
+                    reachability_chunks = None
 
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 if num_chunks <= start_chunk_idx:

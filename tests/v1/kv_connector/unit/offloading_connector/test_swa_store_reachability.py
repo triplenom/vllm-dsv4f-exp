@@ -3,135 +3,179 @@
 """Regression tests for upstream #54362: SWA store reachability during chunked
 prefill.
 
-During active chunked prefill the offloading scheduler must evaluate SWA store
-reachability against the FINAL intended prompt horizon, not the current
-intermediate chunked-prefill frontier. The pre-fix behaviour treated each step
-as the final partial segment and over-stored unreachable SWA chunks; it also
-missed the final reachable tail when a request aborted before the intended
-horizon.
+These tests drive the real ``OffloadingConnectorScheduler._build_store_jobs``
+path through the engine ``request_runner`` harness (not the reachability helper
+in isolation) and assert the set of SWA chunks actually selected for storage.
 
-The reachability decision itself (is_store_reachable_swa_chunk) is unchanged;
-this test asserts the projected-horizon store set that _build_store_jobs now
-produce for the SWA group.
+They cover an intermediate chunked-prefill step, normal completed chunked
+prefill, aborted chunked prefill (reconsideration of the actual final frontier),
+synchronous and asynchronous scheduling, and the active decode frontier not
+being reinterpreted as a final partial prompt/SWA segment.
+
+The expected store set is computed from an independent segment-alignment oracle
+so the test does not merely recompute the production helper logic.
 """
 import pytest
+import torch
 
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
-    is_store_reachable_swa_chunk,
+from tests.v1.kv_connector.unit.offloading_connector.utils import (
+    generate_store_output,
 )
-from vllm.utils.math_utils import cdiv
-
-
-def _reachable_at_horizon(
-    final_chunks: int, alignment: int, sw_chunks: int, eagle: bool
-) -> set[int]:
-    """SWA chunk indices reachable at a given (final) store horizon."""
-    return {
-        c
-        for c in range(final_chunks)
-        if is_store_reachable_swa_chunk(c, final_chunks, alignment, sw_chunks, eagle)
-    }
-
-
-def _b3_store_set(
-    frontier: int, alignment: int, sw_chunks: int, eagle: bool
-) -> set[int]:
-    """Chunks the pre-fix code stored when it evaluated reachability against the
-    current step's frontier (storable_chunk_count == frontier)."""
-    return {
-        c
-        for c in range(frontier)
-        if is_store_reachable_swa_chunk(c, frontier, alignment, sw_chunks, eagle)
-    }
-
-
-# Group configuration matching the DeepSeek-V4 hybrid case: a full-attention
-# group with a larger block size defines the alignment segment; the SWA group
-# has a smaller block size and a sliding window smaller than one segment.
-ALIGNMENT = 4
-SW_CHUNKS = 2
-EAGLE = False
-
-
-def test_completed_chunked_prefill_uses_final_horizon_not_intermediate():
-    """A completed 4-chunk SWA segment must store only the reachable tail
-    (chunks 2,3). The intermediate-frontier behaviour over-stored 0,1,2,3."""
-    final_chunks = 4
-    expected = _reachable_at_horizon(final_chunks, ALIGNMENT, SW_CHUNKS, EAGLE)
-    assert expected == {2, 3}
-
-    # Pre-fix: evaluating at each intermediate frontier (1..4) cumulatively
-    # stored chunks that the load path can never request.
-    b3_union = set()
-    for frontier in range(1, final_chunks + 1):
-        b3_union |= _b3_store_set(frontier, ALIGNMENT, SW_CHUNKS, EAGLE)
-    assert b3_union == {0, 1, 2, 3}
-    assert b3_union != expected, "pre-fix horizon produced the wrong SWA set"
-
-
-def test_multi_segment_completed_prefill_stores_only_reachable_tail():
-    """Two alignment segments (8 SWA chunks): only 2,3,6,7 are reachable."""
-    final_chunks = 8
-    expected = _reachable_at_horizon(final_chunks, ALIGNMENT, SW_CHUNKS, EAGLE)
-    assert expected == {2, 3, 6, 7}
-
-    b3_union = set()
-    for frontier in range(1, final_chunks + 1):
-        b3_union |= _b3_store_set(frontier, ALIGNMENT, SW_CHUNKS, EAGLE)
-    assert expected < b3_union, "pre-fix over-stored unreachable SWA chunks"
-
-
-def test_aborted_prefill_reconsiders_newly_reachable_tail():
-    """If the request aborts at 3 of 4 intended chunks, the actual frontier (3)
-    becomes the final horizon and SWA chunks 1,2 become reachable. The fix must
-    store exactly {1,2} and never the previously-skipped-but-now-unreachable 0."""
-    final_chunks = 4
-    abort_at = 3
-    expected_abort = _reachable_at_horizon(abort_at, ALIGNMENT, SW_CHUNKS, EAGLE)
-    assert expected_abort == {1, 2}
-
-    # union of the reachable sets at all frontiers the request traversed.
-    stored = set()
-    for frontier in range(1, abort_at + 1):
-        # The fix re-evaluates against the final (abort) horizon and the cache
-        # dedups, so the stored set equals the abort-horizon reachable set.
-        stored |= _reachable_at_horizon(abort_at, ALIGNMENT, SW_CHUNKS, EAGLE)
-    assert stored == {1, 2}
-
-
-def test_eagle_trailing_chunk_still_excluded():
-    """EAGLE/MTP trailing chunk remains excluded: reachable tail includes the
-    extra draft chunk, matching SchedulerOffloadConfig is_eagle_group=True."""
-    eagle = True
-    final_chunks = 4
-    reachable = _reachable_at_horizon(final_chunks, ALIGNMENT, SW_CHUNKS, eagle)
-    # SWA reachable tail expands by the one volatile draft tail chunk.
-    assert 3 in reachable
-    assert 2 in reachable
-
-
-@pytest.mark.parametrize(
-    "final_chunks,expected",
-    [
-        (4, {2, 3}),
-        (8, {2, 3, 6, 7}),
-        (12, {2, 3, 6, 7, 10, 11}),
-    ],
+from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
 )
-def test_reachable_set_matches_segment_alignment(final_chunks, expected):
-    assert _reachable_at_horizon(final_chunks, ALIGNMENT, SW_CHUNKS, EAGLE) == expected
+from vllm.v1.request import RequestStatus
+
+FULL_ATTN_BLOCK_SIZE = 36
+SWA_BLOCK_SIZE = 4
+SLIDING_WINDOW = 16
+ALIGNMENT_CHUNKS = FULL_ATTN_BLOCK_SIZE // SWA_BLOCK_SIZE
+SLIDING_WINDOW_CHUNKS = SLIDING_WINDOW // SWA_BLOCK_SIZE
 
 
-def test_alignment_chunk_count_derivation():
-    """SchedulerOffloadConfig computes alignment_chunk_count when the SWA group
-    has a smaller tokens_per_chunk than the single full-attention alignment."""
-    # Full-attn tokens_per_chunk=16, SWA tokens_per_chunk=4, SWA window=8.
-    alignment_tokens = 16
-    sw_tokens_per_chunk = 4
-    sw_window_chunks = cdiv(8, sw_tokens_per_chunk)
-    per_segment = alignment_tokens // sw_tokens_per_chunk
-    if sw_window_chunks < per_segment:
-        alignment_chunk_count = per_segment
-    else:
-        alignment_chunk_count = None
-    assert alignment_chunk_count == 4
+def _hybrid_groups():
+    """DeepSeek-V4 hybrid layout: full-attention alignment + a smaller SWA group."""
+    return [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=FULL_ATTN_BLOCK_SIZE,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=SWA_BLOCK_SIZE,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=SLIDING_WINDOW,
+            ),
+        ),
+    ]
+
+
+def _expected_swa_chunks(store_horizon_chunks) -> list[int]:
+    """Independent oracle: the reachable SWA chunk set at a final horizon."""
+    expected: list[int] = []
+    for chunk in range(store_horizon_chunks):
+        segment_start = chunk - chunk % ALIGNMENT_CHUNKS
+        segment_length = min(
+            ALIGNMENT_CHUNKS, store_horizon_chunks - segment_start
+        )
+        if (
+            chunk % ALIGNMENT_CHUNKS
+            >= segment_length - SLIDING_WINDOW_CHUNKS
+        ):
+            expected.append(chunk)
+    return expected
+
+
+def _stored_swa_chunks(runner) -> list[int]:
+    return sorted(
+        block.request_block_offset
+        for transfer in runner.completed_stores
+        for block in transfer.gpu_blocks
+        if block.group_idx == 1
+    )
+
+
+def _make_runner(request_runner, async_scheduling):
+    return request_runner(
+        block_size=SWA_BLOCK_SIZE,
+        num_gpu_blocks=1000,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=_hybrid_groups(),
+    )
+
+
+def _run_prefill(request_runner, num_tokens, abort_after_first, async_scheduling):
+    runner = _make_runner(request_runner, async_scheduling)
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    def abort_after_prefill_step():
+        if runner.scheduler.running:
+            runner.scheduler.finish_requests(
+                (str(runner.req_id),), RequestStatus.FINISHED_ABORTED
+            )
+
+    runner._run(
+        [1] if abort_after_first else [1, 1, EOS_TOKEN_ID],
+        complete_transfers=True,
+        post_step_fn=(abort_after_prefill_step if abort_after_first else None),
+    )
+    return runner
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_completed_chunked_prefill_stores_final_horizon_tail(
+    request_runner, async_scheduling
+):
+    """A completed chunked prefill stores the reachable tail of the final
+    prompt horizon, so unreachable interior chunks are skipped while the final
+    partial-segment tail is included."""
+    num_tokens = 1200
+    store_horizon_chunks = num_tokens // SWA_BLOCK_SIZE
+
+    runner = _run_prefill(
+        request_runner,
+        num_tokens,
+        abort_after_first=False,
+        async_scheduling=async_scheduling,
+    )
+
+    stored = _stored_swa_chunks(runner)
+    expected = _expected_swa_chunks(store_horizon_chunks)
+    assert stored == expected
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_aborted_chunked_prefill_reconsiders_final_tail(
+    request_runner, async_scheduling
+):
+    """An aborted chunked prefill uses its actual computed frontier as the final
+    horizon and stores the newly reachable tail of the final segment."""
+    num_tokens = 1200
+    abort_tokens = 1000
+    store_horizon_chunks = abort_tokens // SWA_BLOCK_SIZE
+
+    runner = _run_prefill(
+        request_runner,
+        num_tokens,
+        abort_after_first=True,
+        async_scheduling=async_scheduling,
+    )
+
+    stored = _stored_swa_chunks(runner)
+    expected = _expected_swa_chunks(store_horizon_chunks)
+    assert sorted(set(stored)) == expected
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_active_decode_does_not_advance_swa_final_horizon(
+    request_runner, async_scheduling
+):
+    """Active decode chunks must not be treated as a final partial SWA segment:
+    the first decode chunk (right after the prompt boundary) is not stored."""
+    prompt_tokens = 1200
+    runner = _make_runner(request_runner, async_scheduling)
+    runner.new_request(token_ids=[0] * prompt_tokens)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    runner._run([1] * 12, complete_transfers=True)
+
+    assert runner.scheduler.running
+    stored = _stored_swa_chunks(runner)
+    first_decode_chunk = prompt_tokens // SWA_BLOCK_SIZE
+    assert first_decode_chunk not in stored
