@@ -58,6 +58,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.simple_kv_offload.debug import debug_log
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -1027,8 +1028,12 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-            from vllm.v1.simple_kv_offload.debug import debug_log
-            debug_log("REQUEST_LIFECYCLE req=%s transition=WAITING_FOR_REMOTE_KVS num_computed_tokens=%d", request.request_id, num_computed_tokens)                    step_skipped_waiting.prepend_request(request)
+                    debug_log(
+                        "REQUEST_LIFECYCLE req=%s transition=WAITING_FOR_REMOTE_KVS num_computed_tokens=%d",
+                        request.request_id,
+                        num_computed_tokens,
+                    )
+                    step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
                     # the request finished the KV transfer.
@@ -2693,8 +2698,12 @@ class Scheduler(SchedulerInterface):
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
-            from vllm.v1.simple_kv_offload.debug import debug_log
-            debug_log("REQUEST_LIFECYCLE req=%s transition=PROMOTED_FROM_REMOTE_KVS new_status=%s", request.request_id, "PREEMPTED" if request.num_preemptions else "WAITING")                request.status = RequestStatus.WAITING
+                request.status = RequestStatus.WAITING
+            debug_log(
+                "REQUEST_LIFECYCLE req=%s transition=PROMOTED_FROM_REMOTE_KVS new_status=%s",
+                request.request_id,
+                "PREEMPTED" if request.num_preemptions else "WAITING",
+            )
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
