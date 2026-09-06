@@ -1125,7 +1125,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             query_end = (
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
-
+            if query_start == query_end:
+                continue
             vis_left_chunk = None
             vis_right_chunk = None
             if dsv4_visible is not None:
