@@ -1831,3 +1831,100 @@ def test_cp_lazy_target_blocks_scaling(cp_world_size: int) -> None:
             f"cp_world_size={cp_world_size}: target_cp={target_cp} should be "
             f"less than target_base={target_base}"
         )
+
+# ---------------------------------------------------------------------------
+# Test 19: Final flush on request finish with subsequent CPU prefix hit
+# ---------------------------------------------------------------------------
+def test_final_flush_and_subsequent_cpu_hit() -> None:
+    """PR #53532 regression: when a request finishes, its final confirmed blocks
+    are queued for store and become discoverable in CPU BlockPool for subsequent requests.
+    """
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    num_blocks = 3
+    req = make_request(num_blocks=num_blocks)
+    kv_blocks = _alloc_and_register(fix, req, num_blocks)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+    # Request finishes. Final flush should queue remaining confirmed blocks
+    sched.request_finished_all_groups(req, kv_blocks.get_block_ids())
+
+    # Check that pending stores exist
+    assert sched.has_pending_stores(), "Final flush should have created a pending store event"
+    store_events = list(sched._store_event_to_blocks.keys())
+    assert len(store_events) == 1
+    store_event = store_events[0]
+
+    # Complete the final flush store
+    simulate_store_completion(sched, store_event)
+
+    # Now a subsequent request with identical prompt should get CPU cache hit
+    req2 = Request(
+        request_id="req-subsequent-after-flush",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens == num_blocks * BLOCK_SIZE, f"Expected {num_blocks * BLOCK_SIZE} hit tokens, got {hit_tokens}"
+    assert is_async is True
+
+
+# ---------------------------------------------------------------------------
+# Test 20: Secondary fine-grained hash registration and lookup across multi-group
+# ---------------------------------------------------------------------------
+def test_multi_group_fine_grained_secondary_hashes() -> None:
+    """Verify multi-group geometry preserves and registers secondary hashes in CPU BlockPool."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, num_groups=1, lazy=False)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    req = make_request(num_blocks=2)
+    # Allocate blocks for the single primary group
+    blocks_g0 = _allocate_gpu_blocks(gpu_pool, req, 2, group_id=0)
+    kv_blocks = KVCacheBlocks(blocks=(blocks_g0,))
+    req.num_computed_tokens = 2 * BLOCK_SIZE
+
+    # Add a secondary hash to one of the GPU blocks to test fine-grained registration
+    sec_hash = make_block_hash_with_group_id(b"sec_hash_bytes_1234", 0)
+    gpu_pool.cached_block_hashes_by_block.setdefault(blocks_g0[0].block_id, set()).add(sec_hash)
+
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    sched_out = make_scheduler_output(
+        {req.request_id: 2 * BLOCK_SIZE},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+    meta = sched.build_connector_meta(sched_out)
+    assert meta.store_event >= 0
+    simulate_store_completion(sched, meta.store_event)
+
+    # Verify that the secondary hash was also registered in CPU BlockPool
+    sec_hit = sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(sec_hash)
+    assert sec_hit is not None, "Secondary/fine-grained hash must be registered in CPU BlockPool"
+
+
+# ---------------------------------------------------------------------------
+# Test 21: Runtime debug logging toggle behavior
+# ---------------------------------------------------------------------------
+def test_debug_logging_toggle(capsys: pytest.CaptureFixture[str]) -> None:
+    """Verify VLLM_SIMPLE_KV_DEBUG toggle controls standard output."""
+    from vllm.v1.simple_kv_offload.debug import debug_log
+    import os
+
+    # Test OFF
+    os.environ.pop("VLLM_SIMPLE_KV_DEBUG", None)
+    debug_log("TEST_LINE_OFF")
+    captured = capsys.readouterr()
+    assert "[SIMPLE_KV_DEBUG]" not in captured.out
+
+    # Test ON
+    os.environ["VLLM_SIMPLE_KV_DEBUG"] = "1"
+    debug_log("TEST_LINE_ON")
+    captured = capsys.readouterr()
+    assert "[SIMPLE_KV_DEBUG] TEST_LINE_ON" in captured.out
+
+    # Cleanup
+    os.environ.pop("VLLM_SIMPLE_KV_DEBUG", None)

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.simple_kv_offload.debug import debug_log
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
@@ -34,11 +36,14 @@ class SimpleCPUOffloadWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.cpu_capacity_bytes = cpu_capacity_bytes
+        self.rank = vllm_config.parallel_config.rank
+        self.world_size = vllm_config.parallel_config.world_size
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.device: torch.device | None = None
         self.num_cpu_blocks: int = 0
+        self.total_bytes_per_block: int = 0
 
         # CUDA streams for the async transfers
         self.load_stream: torch.cuda.Stream | None = None
@@ -57,9 +62,9 @@ class SimpleCPUOffloadWorker:
         # Metadata for the current step
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
 
-        # Compute-done event recorded before each store; reused across steps
-        # (get_finished runs once per step, copy queue is FIFO).
+        # Compute-done event recorded before each store and load; reused across steps
         self._store_compute_done: torch.Event | None = None
+        self._load_compute_done: torch.Event | None = None
 
         # Pending event index sets, populated in bind_connector_metadata
         self._pending_load_event_indices: set[int] = set()
@@ -142,6 +147,7 @@ class SimpleCPUOffloadWorker:
             t.stride(0) * t.element_size() for t in unique_gpu_caches.values()
         ]
         total_bytes_per_block = sum(per_tensor_bpb)
+        self.total_bytes_per_block = total_bytes_per_block
 
         self.num_cpu_blocks = max(1, self.cpu_capacity_bytes // total_bytes_per_block)
 
@@ -151,6 +157,15 @@ class SimpleCPUOffloadWorker:
             len(unique_gpu_caches),
             self.num_cpu_blocks,
             (self.num_cpu_blocks * total_bytes_per_block) / (1024**3),
+        )
+        debug_log(
+            "INIT_WORKER rank=%d pid=%d unique_tensors=%d cpu_blocks=%d total_cpu_gb=%.2f bytes_per_block=%d",
+            self.rank,
+            os.getpid(),
+            len(unique_gpu_caches),
+            self.num_cpu_blocks,
+            (self.num_cpu_blocks * total_bytes_per_block) / (1024**3),
+            total_bytes_per_block,
         )
 
         pin_memory = PIN_MEMORY
@@ -213,8 +228,9 @@ class SimpleCPUOffloadWorker:
         Stores (GPU->CPU) read the live KV cache, which the compute stream may
         still be writing under v1 overlapped execution, so they are ordered
         after a compute-done event recorded on the current stream. Loads
-        (CPU->GPU) read stable pinned host memory and launch immediately. See
-        #45704 for the bug and #39306 for the srcAccessOrder rationale.
+        (CPU->GPU) write into the live GPU KV cache, so to prevent overwriting
+        blocks that prior compute may still be reading, loads are also ordered
+        after a compute-done event.
 
         Returns:
             tuple of (finished_sending, finished_recving).
@@ -225,17 +241,36 @@ class SimpleCPUOffloadWorker:
         metadata = self._connector_metadata
         if metadata is not None:
             if metadata.load_cpu_blocks:
+                if self._load_compute_done is None:
+                    self._load_compute_done = torch.Event()
+                self._load_compute_done.record(torch.cuda.current_stream())
+                debug_log(
+                    "LOAD_LAUNCH rank=%d event=%d n_blocks=%d bytes=%d reqs=%s",
+                    self.rank,
+                    metadata.load_event,
+                    len(metadata.load_cpu_blocks),
+                    len(metadata.load_cpu_blocks) * self.total_bytes_per_block,
+                    metadata.load_event_to_reqs.get(metadata.load_event, []),
+                )
                 self._backend.launch_copy(
                     metadata.load_cpu_blocks,
                     metadata.load_gpu_blocks,
                     is_store=False,
                     event_idx=metadata.load_event,
                     events_list=self._load_events,
+                    wait_event=self._load_compute_done,
                 )
             if metadata.store_gpu_blocks:
                 if self._store_compute_done is None:
                     self._store_compute_done = torch.Event()
                 self._store_compute_done.record(torch.cuda.current_stream())
+                debug_log(
+                    "STORE_LAUNCH rank=%d event=%d n_blocks=%d bytes=%d",
+                    self.rank,
+                    metadata.store_event,
+                    len(metadata.store_gpu_blocks),
+                    len(metadata.store_gpu_blocks) * self.total_bytes_per_block,
+                )
                 self._backend.launch_copy(
                     metadata.store_gpu_blocks,
                     metadata.store_cpu_blocks,
@@ -257,12 +292,23 @@ class SimpleCPUOffloadWorker:
                 )
                 if req_ids:
                     finished_recving.update(req_ids)
+                    debug_log(
+                        "LOAD_COMPLETE rank=%d event=%d completed_reqs=%s",
+                        self.rank,
+                        j,
+                        req_ids,
+                    )
 
         if self._pending_store_event_indices:
             store_wm = self._poll_stream_events(is_store=True)
             for j in [j for j in self._pending_store_event_indices if j <= store_wm]:
                 self._pending_store_event_indices.discard(j)
                 self._completed_store_events[j] = 1
+                debug_log(
+                    "STORE_COMPLETE rank=%d event=%d reported",
+                    self.rank,
+                    j,
+                )
 
         return None, finished_recving or None
 
